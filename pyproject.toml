@@ -28,6 +28,8 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "seaborn",
+    # the pypi build is a pre-numpy-2 snapshot and raises on an empty mask
+    "surface-distance @ git+https://github.com/google-deepmind/surface-distance",
     "tabulate",
     "templateflow",
     "timm",

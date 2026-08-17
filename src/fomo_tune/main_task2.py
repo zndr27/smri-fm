@@ -1,13 +1,16 @@
-"""FOMO task 2: meningioma segmentation, scored by per-subject Dice as the challenge scores it.
+"""FOMO task 2: meningioma segmentation, scored by per-subject Dice and NSD as the challenge does.
 
 **`Task2Method` is what we tune.** Today: a frozen sMRI MAE over flair, one token per 8mm patch,
 and a logistic head predicting each patch's tumour fraction. `predict_proba` returns that fraction
 as a volume on the input's own grid; the method does not decide where to cut it.
 
 **The protocol is held fixed**, or scores stop being comparable across iterations: leave one
-subject out, Dice at every threshold in a fixed grid, then the single cut maximizing mean Dice
-over the out-of-fold subjects. That cut is tuned on the subjects it is then scored on, so the
+subject out, Dice and NSD at every threshold in a fixed grid, then the single cut maximizing mean
+Dice over the out-of-fold subjects. That cut is tuned on the subjects it is then scored on, so the
 number is somewhat inflated -- as is anything else tuned by re-running and reading it.
+
+The task rank is the mean of the Dice rank and the NSD rank, so both are reported; the cut the
+method ships stays the Dice-optimal one, and `nsd_threshold` records what NSD would have chosen.
 
 `train` runs the protocol then fits and saves a head; `predict` is the challenge contract. Both go
 through `Task2Method.predict_proba`, so every fold exercises the path the submission runs.
@@ -223,25 +226,45 @@ class Task2Method:
 # challenge hands over all the modalities whether or not a model uses them.
 IMAGE_COLS = ("dwi_b1000", "flair")
 
-# Probabilities sit near the 2.4e-4 voxel prevalence, so the grid is geometric rather than linear.
-THRESHOLDS = np.logspace(-6, -0.3, 60)
+# A patch-fraction readout sits near the 2.4e-4 voxel prevalence; a trained decoder sits near 0.5.
+THRESHOLDS = np.unique(np.concatenate([np.logspace(-6, -0.3, 60), np.linspace(0.55, 0.999, 20)]))
 
 
 class Curves(NamedTuple):
     """Everything the protocol reports is a read off these, so no fold is ever recomputed."""
 
     dice: np.ndarray  # (n_subjects, n_thresholds)
+    nsd: np.ndarray  # (n_subjects, n_thresholds)
     predicted_voxels: np.ndarray  # (n_subjects, n_thresholds)
     true_voxels: np.ndarray  # (n_subjects,)
 
 
+def normalized_surface_distance(
+    prediction: np.ndarray, truth: np.ndarray, spacing: tuple[float, float, float]
+) -> float:
+    """Surface dice at 1mm, as `fomo26/fomo-metrics` computes it: google-deepmind's
+    surface-distance, and a score of zero whenever either mask is empty."""
+    # imported here, not at the top, so the submission container needs no metric stack to `predict`
+    import surface_distance
+
+    if not prediction.any() or not truth.any():
+        return 0.0
+
+    distances = surface_distance.compute_surface_distances(truth, prediction, spacing)
+    return float(surface_distance.compute_surface_dice_at_tolerance(distances, 1.0))
+
+
 def subject_curves(
-    method: Task2Method, probabilities: np.ndarray, truth: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """One subject's Dice and predicted voxel count at every threshold in THRESHOLDS."""
+    method: Task2Method,
+    probabilities: np.ndarray,
+    truth: np.ndarray,
+    spacing: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One subject's Dice, NSD and predicted voxel count at every threshold in THRESHOLDS."""
     true_voxels = int(truth.sum())
 
     dice = np.zeros(len(THRESHOLDS))
+    nsd = np.zeros(len(THRESHOLDS))
     predicted = np.zeros(len(THRESHOLDS))
     for i, threshold in enumerate(THRESHOLDS):
         prediction = method.binarize(probabilities, threshold)
@@ -251,56 +274,67 @@ def subject_curves(
 
         predicted[i] = predicted_voxels
         dice[i] = 2 * overlap / denominator if denominator else 1.0
-    return dice, predicted
+        nsd[i] = normalized_surface_distance(prediction, truth, spacing)
+    return dice, nsd, predicted
 
 
 def leave_one_out(rows: list[dict], method: Task2Method) -> Curves:
     """Every subject's threshold curves, predicted by a head fit on the other n-1."""
-    dice, predicted, true = [], [], []
+    dice, nsd, predicted, true = [], [], [], []
     start = time.perf_counter()
     for row in rows:
         method.fit([r for r in rows if r["subject"] != row["subject"]])
 
         probabilities = method.predict_proba({key: row[key] for key in IMAGE_COLS})
-        truth = np.asarray(repack(row["seg"]).dataobj).round() > 0
+        seg = repack(row["seg"])
+        truth = np.asarray(seg.dataobj).round() > 0
         assert probabilities.shape == truth.shape, "probabilities are not on the label grid"
 
-        subject_dice, subject_predicted = subject_curves(
-            method, np.asarray(probabilities.dataobj), truth
+        # slices are 5-7mm against sub-mm in plane, and NSD is scored at a 1mm tolerance
+        spacing = tuple(float(zoom) for zoom in seg.header.get_zooms()[:3])
+        subject_dice, subject_nsd, subject_predicted = subject_curves(
+            method, np.asarray(probabilities.dataobj), truth, spacing
         )
         dice.append(subject_dice)
+        nsd.append(subject_nsd)
         predicted.append(subject_predicted)
         true.append(int(truth.sum()))
 
         best = subject_dice.argmax()
         logger.info(
             f"fold {len(dice)}/{len(rows)} {row['subject']} best={subject_dice[best]:.3f} "
-            f"at thr={THRESHOLDS[best]:.2e} vox={true[-1]} "
+            f"nsd={subject_nsd[best]:.3f} at thr={THRESHOLDS[best]:.2e} vox={true[-1]} "
             f"({time.perf_counter() - start:.0f}s)"
         )
-    return Curves(np.stack(dice), np.stack(predicted), np.array(true))
+    return Curves(np.stack(dice), np.stack(nsd), np.stack(predicted), np.array(true))
 
 
 def score(curves: Curves, seed: int = 0, n_boot: int = 2000, alpha: float = 0.05) -> dict:
-    """Mean per-subject Dice at the best single threshold, plus a percentile CI over subjects.
+    """Mean per-subject Dice and NSD, each at its own best single threshold, plus a percentile CI
+    over subjects. Both metrics resample the same subjects, so their intervals are comparable.
 
-    `dice_oracle` lets every subject cut where it likes, which bounds any thresholding rule.
+    `<metric>_oracle` lets every subject cut where it likes, which bounds any thresholding rule.
+    `threshold` is what the method ships, and stays the Dice-optimal cut.
     """
-    best = int(curves.dice.mean(axis=0).argmax())
-    dice = curves.dice[:, best]
-
+    n_subjects = len(curves.true_voxels)
     rng = np.random.default_rng(seed)
-    resamples = rng.integers(0, len(dice), size=(n_boot, len(dice)))
-    samples = dice[resamples].mean(axis=1)
-    low, high = np.percentile(samples, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    resamples = rng.integers(0, n_subjects, size=(n_boot, n_subjects))
 
-    return {
-        "dice": float(dice.mean()),
-        "dice_ci_low": float(low),
-        "dice_ci_high": float(high),
-        "dice_oracle": float(curves.dice.max(axis=1).mean()),
-        "threshold": float(THRESHOLDS[best]),
-    }
+    summary = {}
+    for name, curve in (("dice", curves.dice), ("nsd", curves.nsd)):
+        best = int(curve.mean(axis=0).argmax())
+        at_best = curve[:, best]
+        samples = at_best[resamples].mean(axis=1)
+        low, high = np.percentile(samples, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+
+        summary[name] = float(at_best.mean())
+        summary[f"{name}_ci_low"] = float(low)
+        summary[f"{name}_ci_high"] = float(high)
+        summary[f"{name}_oracle"] = float(curve.max(axis=1).mean())
+        summary[f"{name}_threshold"] = float(THRESHOLDS[best])
+
+    summary["threshold"] = summary["dice_threshold"]
+    return summary
 
 
 # ---- entrypoints ------------------------------------------------------------------------

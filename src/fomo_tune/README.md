@@ -67,7 +67,7 @@ uv run python third_party/container-validator/container_validator/validate.py \
 | Task | n | Inputs | Output | Split | Notes |
 |---|---|---|---|---|---|
 | 1 infarct | 21 | adc, dwi_b1000, flair (+t2s/swi) | probability | LOO | done |
-| 2 meningioma | 23 | dwi_b1000, flair (+t2s/swi) | mask, input grid | LOO | drafted — flair only, per-subject **Dice** |
+| 2 meningioma | 23 | dwi_b1000, flair (+t2s/swi) | mask, input grid | LOO | drafted — flair only, per-subject **Dice and NSD**, each with its own bootstrap CI |
 | 3 brain age | 494 | t1w | age in years | 20-fold | done — RidgeCV head, **Pearson r and MAE**, each with its own bootstrap CI |
 | 4 trigeminal | 40 | t2w | mask, labels 1=nerve 2=vessel | — | tabled |
 | 5 polymicrogyria | 48 | t1w | probability | 20-fold | done |
@@ -82,15 +82,20 @@ uv run python third_party/container-validator/container_validator/validate.py \
 | baseline | 0.990 | 0.944 – 1.000 | 11s | `1df2e5d`† | dwi_b1000 only, `LogisticRegressionCV` |
 | walnut-v0.1 | 0.894 | 0.731 – 1.000 | 11s | `ead1264` | vitl/sub-52k checkpoint, baseline otherwise |
 
-### Task 2 — meningioma, Dice, LOO over 23
+### Task 2 — meningioma, Dice and NSD, LOO over 23
 
-| Run | Dice | 95% CI | Oracle | Time | Git | Notes |
-|---|---|---|---|---|---|---|
-| baseline | 0.195 | 0.098 – 0.303 | 0.271 | 174s | `7d13f45` | flair only, largest-component filter, threshold 0.011 |
-| no largest component | 0.170 | 0.082 – 0.266 | 0.226 | 132s | `7508a46`-dirty | threshold 0.085 |
-| walnut-v0.1 | 0.195 | 0.092 – 0.306 | 0.234 | 173s | `ead1264` | vitl/sub-52k checkpoint, baseline otherwise, threshold 0.018 |
+The challenge ranks this task on the mean of the Dice rank and the NSD rank. Rows above
+`baseline + nsd` predate the protocol reporting NSD, so their NSD column is empty rather than zero.
 
-Oracle is the per-subject best threshold — the ceiling any thresholding rule could reach.
+| Run | Dice | 95% CI | Oracle | NSD | 95% CI | Oracle | Time | Git | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.195 | 0.098 – 0.303 | 0.271 | — | — | — | 174s | `7d13f45` | flair only, largest-component filter, threshold 0.011 |
+| no largest component | 0.170 | 0.082 – 0.266 | 0.226 | — | — | — | 132s | `7508a46`-dirty | threshold 0.085 |
+| walnut-v0.1 | 0.195 | 0.092 – 0.306 | 0.234 | — | — | — | 173s | `ead1264` | vitl/sub-52k checkpoint, baseline otherwise, threshold 0.018 |
+
+Oracle is the per-subject best threshold — the ceiling any thresholding rule could reach. The
+shipped cut maximizes mean Dice; `nsd_threshold` in `metrics.json` records what NSD would have
+picked instead.
 
 ### Task 3 — brain age, 20-fold over 494
 

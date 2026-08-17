@@ -1,18 +1,22 @@
-"""CPU tests for the task 2 protocol. The encoder cannot run on CPU, so nothing here builds one:
-`binarize` and `subject_curves` only read `cfg`, so a stand-in stands in for the method."""
+"""CPU tests for the task 2 protocol and decoder. The encoder cannot run on CPU, so nothing here
+builds one: `binarize` and `subject_curves` only read `cfg`, so a stand-in stands in for the
+method, and `ConvDecoder` is a plain module that runs anywhere."""
 
 from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from fomo_tune.main_task2 import (
     THRESHOLDS,
     Config,
+    ConvDecoder,
     Curves,
     Task2Method,
     normalized_surface_distance,
     score,
+    segmentation_loss,
     subject_curves,
 )
 
@@ -105,3 +109,38 @@ def test_score_reports_both_metrics_and_ships_the_dice_cut():
     assert summary["dice_threshold"] == THRESHOLDS[10]
     assert summary["nsd_threshold"] == THRESHOLDS[20]
     assert summary["threshold"] == summary["dice_threshold"]
+
+
+def test_decoder_undoes_the_patch_grid():
+    """Three doublings take the 26x30x26 token grid back to the 208x240x208 the encoder saw."""
+    decoder = ConvDecoder(dim=16)
+    logits = decoder(torch.zeros(1, 16, 4, 5, 4))
+    assert logits.shape == (1, 1, 32, 40, 32)
+
+
+def test_decoder_can_vary_within_a_patch():
+    """The whole point: two voxels inside one 8mm patch can take different values."""
+    decoder = ConvDecoder(dim=16)
+    logits = decoder(torch.randn(1, 16, 4, 5, 4))
+    patch = logits[0, 0, :8, :8, :8]
+    assert patch.std() > 0
+
+
+def test_segmentation_loss_prefers_the_right_answer():
+    target = torch.zeros(1, 1, 8, 8, 8)
+    target[..., 2:6, 2:6, 2:6] = 1.0
+    confident = torch.where(target > 0, 6.0, -6.0)
+
+    assert segmentation_loss(confident, target, 100.0) < segmentation_loss(
+        -confident, target, 100.0
+    )
+
+
+def test_segmentation_loss_punishes_predicting_nothing():
+    """At a 2.4e-4 prevalence, an all-zero prediction is what an unweighted BCE settles on."""
+    target = torch.zeros(1, 1, 16, 16, 16)
+    target[..., 7:9, 7:9, 7:9] = 1.0
+    empty = torch.full_like(target, -6.0)
+    partial = torch.where(target > 0, 2.0, -6.0)
+
+    assert segmentation_loss(partial, target, 100.0) < segmentation_loss(empty, target, 100.0)

@@ -1,8 +1,8 @@
 """FOMO task 2: meningioma segmentation, scored by per-subject Dice and NSD as the challenge does.
 
 **`Task2Method` is what we tune.** Today: a frozen sMRI MAE over flair, one token per 8mm patch,
-and a logistic head predicting each patch's tumour fraction. `predict_proba` returns that fraction
-as a volume on the input's own grid; the method does not decide where to cut it.
+and a conv decoder upsampling the token grid to voxel logits. `predict_proba` returns those
+probabilities as a volume on the input's own grid; the method does not decide where to cut it.
 
 **The protocol is held fixed**, or scores stop being comparable across iterations: leave one
 subject out, Dice and NSD at every threshold in a fixed grid, then the single cut maximizing mean
@@ -12,8 +12,8 @@ number is somewhat inflated -- as is anything else tuned by re-running and readi
 The task rank is the mean of the Dice rank and the NSD rank, so both are reported; the cut the
 method ships stays the Dice-optimal one, and `nsd_threshold` records what NSD would have chosen.
 
-`train` runs the protocol then fits and saves a head; `predict` is the challenge contract. Both go
-through `Task2Method.predict_proba`, so every fold exercises the path the submission runs.
+`train` runs the protocol then fits and saves a decoder; `predict` is the challenge contract. Both
+go through `Task2Method.predict_proba`, so every fold exercises the path the submission runs.
 """
 
 import argparse
@@ -24,19 +24,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-import joblib
 import nibabel as nib
 import numpy as np
 import torch
-from einops import reduce, repeat
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from scipy import ndimage
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.preprocessing import StandardScaler
+from timm.utils import ModelEmaV3
+from torch import Tensor, nn
 
 from fomo_tune.backbone import load_backbone
 from fomo_tune.utils import git_sha, set_seed, setup_logging
+from smri_mae.utils import WarmupThenCosine
 
 logger = logging.getLogger("fomo_tune")
 
@@ -50,7 +49,11 @@ class Config:
     modality: str = "flair"
     output_root: str = "output/fomo_tune"
     name: str = "task2"
-    inverse_reg: float = 1.0
+    lr: float = 1e-3
+    steps: int = 400
+    warmup_steps: int = 40
+    ema_start: int = 100
+    pos_weight: float = 100.0
     largest_component: bool = True
     device: str = "cuda"
     seed: int = 4466
@@ -80,31 +83,51 @@ def resample_nearest(
 
 
 class Patches(NamedTuple):
-    """One subject's kept patches, plus the tumour-voxel count of every patch on the grid."""
+    """One subject's kept patches, plus the tumour mask on the grid those patches tile."""
 
     features: np.ndarray  # (n_kept, dim)
     patch_ids: np.ndarray  # (n_kept,) indices into the flattened patch grid
-    counts: np.ndarray  # (n_patches,)
+    labels: np.ndarray  # img_size, bool
 
 
-def fit_head(features: np.ndarray, counts: np.ndarray, voxels: int, inverse_reg: float) -> Pipeline:
-    """Voxel-level logistic regression, each patch collapsed to one positive and one negative row.
+class ConvDecoder(nn.Module):
+    """Token grid to voxel logits. Three doublings undo the 8mm patch, so the boundary the head
+    can draw is no longer a staircase of whole patches."""
 
-    Unbalanced on purpose: the fitted probability is then the patch's tumour fraction.
-    """
-    has_tumour = counts > 0
-    rows = np.concatenate([features, features[has_tumour]])
-    labels = np.concatenate([np.zeros(len(features)), np.ones(has_tumour.sum())])
-    weights = np.concatenate([voxels - counts, counts[has_tumour]])
+    def __init__(self, dim: int):
+        super().__init__()
+        self.project = nn.Conv3d(dim, 32, kernel_size=1)
+        self.blocks = nn.ModuleList(
+            [
+                nn.Conv3d(32, 16, kernel_size=3, padding=1),
+                nn.Conv3d(16, 8, kernel_size=3, padding=1),
+                nn.Conv3d(8, 4, kernel_size=3, padding=1),
+            ]
+        )
+        self.head = nn.Conv3d(4, 1, kernel_size=3, padding=1)
 
-    keep = weights > 0
-    head = make_pipeline(StandardScaler(), LogisticRegression(C=inverse_reg, max_iter=1000))
-    head.fit(rows[keep], labels[keep], logisticregression__sample_weight=weights[keep])
-    return head
+    def forward(self, tokens: Tensor) -> Tensor:
+        x = F.gelu(self.project(tokens))
+        for block in self.blocks:
+            x = F.interpolate(x, scale_factor=2, mode="trilinear", align_corners=False)
+            x = F.gelu(block(x))
+        return self.head(x)
+
+
+def segmentation_loss(logits: Tensor, target: Tensor, pos_weight: float) -> Tensor:
+    """Weighted BCE plus soft Dice. At a 2.4e-4 voxel prevalence plain BCE is happy predicting
+    nothing, and soft Dice alone gives almost no gradient until the mask overlaps at all."""
+    weight = torch.tensor(pos_weight, device=logits.device)
+    bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=weight)
+
+    probabilities = torch.sigmoid(logits)
+    overlap = (probabilities * target).sum()
+    soft_dice = 1 - (2 * overlap + 1) / (probabilities.sum() + target.sum() + 1)
+    return bce + soft_dice
 
 
 class Task2Method:
-    """Frozen sMRI MAE, per-patch tokens, logistic head on the patch tumour fraction."""
+    """Frozen sMRI MAE, per-patch tokens, conv decoder from the token grid to voxel logits."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -115,12 +138,11 @@ class Task2Method:
 
         patchify = self.backbone.encoder.patchify
         self.grid_size = tuple(patchify.grid_size)
-        self.patch_size = tuple(patchify.patch_size)
         self.img_size = tuple(patchify.img_size)
-        self.voxels_per_patch = int(np.prod(self.patch_size))
 
+        self.dim = self.backbone.encoder.patch_embed.out_features
         self.cache: dict[str, Patches] = {}
-        self.head = None
+        self.decoder = None
         self.threshold = None
 
     @torch.inference_mode()
@@ -137,48 +159,67 @@ class Task2Method:
         patch_ids = out["patch_ids"][0][keep].cpu().numpy()
         return features, patch_ids, sample["affine"].numpy()
 
-    def patch_counts(self, seg: nib.Nifti1Image, grid_affine: np.ndarray) -> np.ndarray:
-        """Tumour voxels per patch, over the whole grid, in the encoder's flattened order."""
+    def patch_labels(self, seg: nib.Nifti1Image, grid_affine: np.ndarray) -> np.ndarray:
+        """The tumour mask on the encoder's own 1mm grid, which is what the decoder writes to."""
         seg = repack(seg)
         labels = np.asarray(seg.dataobj, dtype=np.float32).round()
-        on_grid = resample_nearest(labels, seg.affine, grid_affine, self.img_size)
-        px, py, pz = self.patch_size
-        return reduce(on_grid, "(gx px) (gy py) (gz pz) -> (gx gy gz)", "sum", px=px, py=py, pz=pz)
+        return resample_nearest(labels, seg.affine, grid_affine, self.img_size) > 0
 
     def cached_patches(self, row: dict) -> Patches:
-        """Cached: leave-one-out revisits every subject n times."""
+        """Cached: leave-one-out revisits every subject n times, and the encoder is frozen."""
         if row["subject"] not in self.cache:
             features, patch_ids, grid_affine = self.embed(row)
-            counts = self.patch_counts(row["seg"], grid_affine)
-            self.cache[row["subject"]] = Patches(features, patch_ids, counts)
+            labels = self.patch_labels(row["seg"], grid_affine)
+            self.cache[row["subject"]] = Patches(features, patch_ids, labels)
         return self.cache[row["subject"]]
 
+    def token_grid(self, features: np.ndarray, patch_ids: np.ndarray) -> Tensor:
+        """Kept tokens scattered back into the dense grid the decoder convolves over. Zero where
+        the encoder kept no token, which is a patch with no in-brain voxel."""
+        grid = torch.zeros(int(np.prod(self.grid_size)), self.dim, device=self.device)
+        grid[patch_ids] = torch.from_numpy(features).to(self.device)
+        return grid.T.reshape(1, self.dim, *self.grid_size)
+
     def fit(self, rows: list[dict]) -> None:
+        """A fresh decoder every call: the protocol refits per fold, and a decoder carried over
+        would have seen the held-out subject."""
         subjects = [self.cached_patches(row) for row in rows]
-        features = np.concatenate([subject.features for subject in subjects])
-        counts = np.concatenate([subject.counts[subject.patch_ids] for subject in subjects])
-        self.head = fit_head(features, counts, self.voxels_per_patch, self.cfg.inverse_reg)
 
-    def predict_proba(self, images: Images) -> nib.Nifti1Image:
-        """Tumour probability per voxel on the input's own grid, constant within each patch."""
-        features, patch_ids, grid_affine = self.embed(images)
-
-        # zero where the encoder kept no token, which is a patch with no in-brain voxel
-        fractions = np.zeros(int(np.prod(self.grid_size)), dtype=np.float32)
-        fractions[patch_ids] = self.head.predict_proba(features)[:, 1]
-
-        gx, gy, gz = self.grid_size
-        px, py, pz = self.patch_size
-        on_grid = repeat(
-            fractions,
-            "(gx gy gz) -> (gx px) (gy py) (gz pz)",
-            gx=gx,
-            gy=gy,
-            gz=gz,
-            px=px,
-            py=py,
-            pz=pz,
+        self.decoder = ConvDecoder(self.dim).to(self.device)
+        ema = ModelEmaV3(self.decoder, decay=0.99, update_after_step=self.cfg.ema_start)
+        optimizer = torch.optim.AdamW(self.decoder.parameters(), lr=self.cfg.lr)
+        schedule = WarmupThenCosine(
+            base_value=self.cfg.lr,
+            final_value=self.cfg.lr / 100,
+            total_iters=self.cfg.steps,
+            warmup_iters=self.cfg.warmup_steps,
         )
+
+        rng = np.random.default_rng(self.cfg.seed)
+        for step in range(self.cfg.steps):
+            for group in optimizer.param_groups:
+                group["lr"] = schedule[step]
+
+            subject = subjects[rng.integers(len(subjects))]
+            tokens = self.token_grid(subject.features, subject.patch_ids)
+            target = torch.from_numpy(subject.labels).to(self.device).float()[None, None]
+
+            loss = segmentation_loss(self.decoder(tokens), target, self.cfg.pos_weight)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            ema.update(self.decoder, step=step)
+
+        self.decoder = ema.module.eval()
+
+    @torch.inference_mode()
+    def predict_proba(self, images: Images) -> nib.Nifti1Image:
+        """Tumour probability per voxel on the input's own grid, at the encoder's 1mm resolution
+        rather than constant within each 8mm patch."""
+        features, patch_ids, grid_affine = self.embed(images)
+        tokens = self.token_grid(features, patch_ids)
+        on_grid = torch.sigmoid(self.decoder(tokens))[0, 0].float().cpu().numpy()
 
         image = repack(images[self.modality])
         on_input = resample_nearest(on_grid, grid_affine, image.affine, image.shape)
@@ -203,10 +244,11 @@ class Task2Method:
         return nib.Nifti1Image(mask.astype(np.uint8), probabilities.affine)
 
     def save(self, model_dir: Path) -> None:
-        """Config, head and threshold; the weights stay wherever `ckpt_path` points."""
+        """Config, decoder and threshold; the backbone stays wherever `ckpt_path` points."""
         model_dir.mkdir(parents=True, exist_ok=True)
         OmegaConf.save(self.cfg, model_dir / "config.yaml")
-        joblib.dump({"head": self.head, "threshold": self.threshold}, model_dir / "head.joblib")
+        state = {"decoder": self.decoder.state_dict(), "threshold": self.threshold}
+        torch.save(state, model_dir / "head.pth")
 
     @classmethod
     def load(cls, model_dir: Path, **overrides) -> "Task2Method":
@@ -215,8 +257,10 @@ class Task2Method:
             OmegaConf.structured(Config), OmegaConf.load(model_dir / "config.yaml"), overrides
         )
         method = cls(cfg)
-        state = joblib.load(model_dir / "head.joblib")
-        method.head, method.threshold = state["head"], state["threshold"]
+        state = torch.load(model_dir / "head.pth", map_location="cpu", weights_only=True)
+        method.decoder = ConvDecoder(method.dim).to(method.device).eval()
+        method.decoder.load_state_dict(state["decoder"])
+        method.threshold = state["threshold"]
         return method
 
 

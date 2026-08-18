@@ -1,0 +1,40 @@
+16:30:59 run task2_conv (git a46e94a)
+16:30:59 config:
+task: task2
+ckpt_path: hf://medarc/walnut/checkpoints/pretrain_full_90_10_h100/checkpoint-last.pth
+modality: flair
+output_root: experiments/fomo_tune_task2_conv/output
+name: task2_conv
+lr: 0.001
+steps: 400
+warmup_steps: 40
+ema_start: 100
+pos_weight: 100.0
+largest_component: true
+device: cuda
+seed: 4466
+16:31:01 dataset: 23 subjects
+16:32:05 fold 1/23 sub-01 best=0.633 nsd=0.511 at thr=1.14e-02 vox=3695 (61s)
+16:32:47 fold 2/23 sub-02 best=0.743 nsd=0.565 at thr=9.14e-03 vox=3047 (104s)
+16:33:30 fold 3/23 sub-03 best=0.009 nsd=0.005 at thr=7.40e-06 vox=292 (147s)
+16:34:13 fold 4/23 sub-04 best=0.796 nsd=0.646 at thr=3.01e-03 vox=4112 (190s)
+16:34:55 fold 5/23 sub-05 best=0.816 nsd=0.744 at thr=9.99e-01 vox=2026 (232s)
+16:35:38 fold 6/23 sub-06 best=0.574 nsd=0.719 at thr=1.06e-01 vox=67 (275s)
+16:36:19 fold 7/23 sub-07 best=0.000 nsd=0.000 at thr=1.00e-06 vox=124 (316s)
+16:37:01 fold 8/23 sub-08 best=0.000 nsd=0.000 at thr=1.00e-06 vox=189 (358s)
+16:37:43 fold 9/23 sub-09 best=0.016 nsd=0.031 at thr=1.33e-04 vox=97 (400s)
+16:38:25 fold 10/23 sub-10 best=0.477 nsd=0.558 at thr=1.43e-02 vox=562 (442s)
+16:39:08 fold 11/23 sub-11 best=0.818 nsd=0.787 at thr=5.74e-01 vox=1058 (485s)
+16:39:52 fold 12/23 sub-12 best=0.000 nsd=0.000 at thr=1.00e-06 vox=543 (529s)
+16:40:39 fold 13/23 sub-13 best=0.665 nsd=0.784 at thr=8.57e-01 vox=229 (576s)
+16:41:24 fold 14/23 sub-14 best=0.000 nsd=0.000 at thr=1.00e-06 vox=1689 (621s)
+16:42:23 fold 15/23 sub-15 best=0.345 nsd=0.175 at thr=9.25e-06 vox=85042 (680s)
+16:43:16 fold 16/23 sub-16 best=0.000 nsd=0.000 at thr=1.00e-06 vox=58 (733s)
+16:44:02 fold 17/23 sub-17 best=0.000 nsd=0.000 at thr=1.00e-06 vox=283 (779s)
+16:44:45 fold 18/23 sub-18 best=0.723 nsd=0.503 at thr=6.33e-04 vox=7908 (822s)
+16:45:32 fold 19/23 sub-19 best=0.006 nsd=0.014 at thr=1.25e-06 vox=1047 (869s)
+16:46:13 fold 20/23 sub-20 best=0.000 nsd=0.000 at thr=1.00e-06 vox=137 (910s)
+16:47:00 fold 21/23 sub-21 best=0.672 nsd=0.401 at thr=2.23e-02 vox=22872 (956s)
+16:47:46 fold 22/23 sub-22 best=0.012 nsd=0.008 at thr=5.48e-05 vox=320 (1003s)
+16:48:30 fold 23/23 sub-23 best=0.039 nsd=0.043 at thr=2.81e-05 vox=1103 (1047s)
+16:49:10 result: dice=0.2585  dice_ci_low=0.1385  dice_ci_high=0.3917  dice_oracle=0.3194  dice_threshold=0.0114  nsd=0.1956  nsd_ci_low=0.0995  nsd_ci_high=0.3005  nsd_oracle=0.2855  nsd_threshold=0.0114  threshold=0.0114  (1047s)

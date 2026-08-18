@@ -1,0 +1,9 @@
+task: task2
+ckpt_path: hf://medarc/walnut/checkpoints/pretrain_full_90_10_h100/checkpoint-last.pth
+modality: flair
+output_root: experiments/fomo_tune_task2_conv/output
+name: task2_linear
+inverse_reg: 1.0
+largest_component: true
+device: cuda
+seed: 4466

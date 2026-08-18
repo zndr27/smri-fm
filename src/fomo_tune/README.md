@@ -92,6 +92,14 @@ The challenge ranks this task on the mean of the Dice rank and the NSD rank. Row
 | baseline | 0.195 | 0.098 – 0.303 | 0.271 | — | — | — | 174s | `7d13f45` | flair only, largest-component filter, threshold 0.011 |
 | no largest component | 0.170 | 0.082 – 0.266 | 0.226 | — | — | — | 132s | `7508a46`-dirty | threshold 0.085 |
 | walnut-v0.1 | 0.195 | 0.092 – 0.306 | 0.234 | — | — | — | 173s | `ead1264` | vitl/sub-52k checkpoint, baseline otherwise, threshold 0.018 |
+| linear, rerun | 0.181 | 0.082 – 0.286 | 0.256 | 0.172 | 0.091 – 0.262 | 0.231 | 350s | `46041b2` | the `baseline` method rerun for NSD, on a 4080 rather than an H100 |
+| conv decoder | 0.258 | 0.139 – 0.392 | 0.319 | 0.196 | 0.099 – 0.301 | 0.286 | 1047s | `a46e94a` | seed 4466 |
+| conv decoder | 0.266 | 0.139 – 0.405 | 0.324 | 0.215 | 0.116 – 0.328 | 0.314 | 1061s | `a46e94a` | seed 1234 |
+
+The last three rows are from one laptop GPU and the three above them from an H100. That is not
+cosmetic: `linear, rerun` is the `baseline` method with no behavioural change, and it scores 0.181
+rather than 0.195 because two subjects flip which connected component is largest. Compare the conv
+rows to `linear, rerun`, not to `baseline`. See `experiments/fomo_tune_task2_conv`.
 
 Oracle is the per-subject best threshold — the ceiling any thresholding rule could reach. The
 shipped cut maximizes mean Dice; `nsd_threshold` in `metrics.json` records what NSD would have
